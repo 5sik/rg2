@@ -125,10 +125,12 @@ class RaisimServer final {
   ~RaisimServer() = default;
 
   /**
+   * @param[in] port the port number to open the socket
    * Setup the port so that it can accept (acceptConnection) incoming connections
    */
-  void setupSocket() {
+  void setupSocket(int port = 8080) {
     tryingToLock_ = false;
+    raisimPort_ = port;
 
 #if __linux__ || __APPLE__
     int opt = 1;
@@ -255,8 +257,8 @@ class RaisimServer final {
     unlockVisualizationServerMutex();
   }
 
-  inline void loop() {
-    setupSocket();
+  inline void loop(int port = 8080) {
+    setupSocket(port);
 
     while (!terminateRequested_) {
       acceptConnection(2);
@@ -293,9 +295,10 @@ class RaisimServer final {
    * start spinning. */
   inline void launchServer(int port = 8080) {
     raisimPort_ = port;
+    tryingToLock_ = false;
 
     threadResult_ = std::async(std::launch::async, [this] {
-      serverThread_ = std::thread(&raisim::RaisimServer::loop, this);
+      serverThread_ = std::thread(&raisim::RaisimServer::loop, this, raisimPort_);
       return true;
     });
   }
@@ -592,15 +595,58 @@ class RaisimServer final {
                                 bool glow = false, bool shadow = false) {
     if (visuals_.find(name) != visuals_.end()) RSFATAL("Duplicated visual object name: " + name)
     updateVisualConfig();
-    visuals_[name] = new Visuals();
-    visuals_[name]->type = Shape::Mesh;
-    visuals_[name]->name = name;
-    visuals_[name]->meshFileName = file;
-    visuals_[name]->size = scale;
-    visuals_[name]->color = {colorR, colorG, colorB, colorA};
-    visuals_[name]->glow = glow;
-    visuals_[name]->shadow = shadow;
+    auto vm = new VisualMesh();
+    vm->type = Shape::Mesh;
+    vm->name = name;
+    vm->meshFileName_ = file;
+    vm->size = scale;
+    vm->color = {colorR, colorG, colorB, colorA};
+    vm->glow = glow;
+    vm->shadow = shadow;
+    visuals_[name] = vm;
     return visuals_[name];
+  }
+
+/**
+ * @param[in] name the name of the visual mesh object
+ * @param[in] file file name of the mesh
+ * @param vertexArray array of vertices Should be a multiple of 3
+ * @param colorArray array of colors in RGB. Should be a multiple of 3
+ * @param indexArray array of triangle index
+ * @param colorR red color value (if colorArray is empty)
+ * @param colorG green color value (if colorArray is empty)
+ * @param colorB blue color value (if colorArray is empty)
+ * @param colorA alpha color value (if colorArray is empty)
+ * @param glow to glow or not (not supported)
+ * @param shadow to cast shadow or not (not supported)
+ * @return the mesh visual pointer (VisualMesh struct)
+ */
+  inline VisualMesh *addVisualMesh(const std::string &name,
+                                   const std::vector<float>& vertexArray,
+                                   const std::vector<uint8_t>& colorArray,
+                                   const std::vector<int32_t>& indexArray,
+                                   double colorR = 0, double colorG = 0,
+                                   double colorB = 0, double colorA = 1,
+                                   bool glow = false, bool shadow = false) {
+    RSFATAL_IF(visuals_.find(name) != visuals_.end(), "Duplicated visual object name: " + name)
+    RSFATAL_IF(vertexArray.size() % 3 != 0, "The number of vertex elements should be a multiple of 3")
+    RSFATAL_IF(colorArray.size() % 3 != 0, "The number of color elements should be a multiple of 3")
+    RSFATAL_IF(indexArray.size() % 3 != 0, "The number of index elements should be a multiple of 3")
+    RSFATAL_IF(colorArray.size() != vertexArray.size(), "The number of the vertex elements and the number of the color elements should be the same")
+
+    updateVisualConfig();
+    auto vm = new VisualMesh();
+    vm->type = Shape::Mesh;
+    vm->name = name;
+    vm->vertexArray_ = vertexArray;
+    vm->colorArray_ = colorArray;
+    vm->indexArray_ = indexArray;
+    vm->color = {colorR, colorG, colorB, colorA};
+    vm->size = {1, 1, 1, 1};
+    vm->glow = glow;
+    vm->shadow = shadow;
+    visuals_[name] = vm;
+    return vm;
   }
 
   /**
@@ -1086,11 +1132,14 @@ class RaisimServer final {
         if (!initialized) {
           data_ = set(data_, visVec->at(j).shape);
           if (visVec->at(j).shape == Shape::Mesh) {
-            data_ = set(data_, visVec->at(j).fileName);
+            data_ = set(data_, int32_t(1), visVec->at(j).fileName);
             data_ = set(data_, as->getResourceDir());
           }
           data_ = set(data_, i, int32_t(visVec->at(j).localIdx));
         }
+
+        if (visVec->at(j).shape == Shape::Mesh)
+          data_ = set(data_, int(false));
 
         if (colorOverride[3] < 0.001)
           data_ = set(data_, colorToString(visVec->at(j).color));
@@ -1125,25 +1174,31 @@ class RaisimServer final {
     }
 
     data_ = set(data_, (int32_t) as->getSensors().size());
+
     // add sensors to be updated
     for (auto &sensor: as->getSensors()) {
       if (!initialized) data_ = sensor.second->serializeProp(data_);
 
+      data_ = set(data_, sensor.second->getMeasurementSource());
+
       if (sensor.second->getMeasurementSource() == Sensor::MeasurementSource::VISUALIZER &&
           sensor.second->getUpdateTimeStamp() + 1. / sensor.second->getUpdateRate()
               < world_->getWorldTime() + 1e-10) {
-        sensor.second->setUpdateTimeStamp(world_->getWorldTime());
-        sensor.second->updatePose();
-        Vec<4> quat;
-        auto &pos = sensor.second->getPosition();
-        auto &rot = sensor.second->getOrientation();
-        rotMatToQuat(rot, quat);
         data_ = set(data_, true);
-        data_ = setInFloat(data_, pos, quat);
         needsSensorUpdate_ = true;
       } else {
         data_ = set(data_, false);
       }
+
+      sensor.second->updatePose();
+      Vec<4> quat;
+      auto &pos = sensor.second->getPosition();
+      auto &rot = sensor.second->getOrientation();
+      rotMatToQuat(rot, quat);
+      data_ = setInFloat(data_, pos, quat);
+
+      if (sensor.second->getMeasurementSource() != Sensor::MeasurementSource::VISUALIZER)
+        data_ = sensor.second->serializeMeasurements(data_);
     }
   }
 
@@ -1239,7 +1294,7 @@ class RaisimServer final {
               break;
             case MESH:
               data_ = set(data_, Shape::Mesh);
-              data_ = set(data_, dynamic_cast<Mesh *>(ob)->getMeshFileName());
+              data_ = set(data_, int32_t(1), dynamic_cast<Mesh *>(ob)->getMeshFileName());
               data_ = set(data_, std::string());
               break;
             case HEIGHTMAP: {
@@ -1255,7 +1310,10 @@ class RaisimServer final {
             case UNRECOGNIZED:
               break;
           }
-          data_ = set(data_, Masking::SB_OBJ, int32_t(0));
+          if (ob->getObjectType() == HALFSPACE || ob->getObjectType() == HEIGHTMAP)
+            data_ = set(data_, Masking::VIS_OBJ, int32_t(0));
+          else
+            data_ = set(data_, Masking::SB_OBJ, int32_t(0));
         }
         auto *sob = dynamic_cast<SingleBodyObject *>(ob);
         auto tempAdd = data_;
@@ -1270,7 +1328,8 @@ class RaisimServer final {
             data_ = setInFloat(data_, hm->getHeightVector());
             data_ = set(data_, hm->getColorMap());
           }
-        }
+        } else if (ob->getObjectType() == ObjectType::MESH)
+          data_ = set(data_, int(false));
 
         data_ = set(data_, sob->getAppearance());
 
@@ -1353,11 +1412,23 @@ class RaisimServer final {
       if (!initialized) {
         data_ = set(data_, vo->name, vo->type);
         if (vo->type == Shape::Mesh) {
-          data_ = set(data_, vo->meshFileName);
-          data_ = set(data_, std::string());
+          auto vm = reinterpret_cast<VisualMesh*>(vo);
+
+          if (vm->meshFileName_.empty())
+            data_ = set(data_, int32_t(0), vm->vertexArray_, vm->indexArray_, vm->colorArray_);
+          else
+            data_ = set(data_, int32_t(1), vm->meshFileName_, std::string());
         }
         data_ = set(data_, Masking::VIS_OBJ, int32_t(0));
       }
+
+      if (vo->type == Shape::Mesh) {
+        auto vm = reinterpret_cast<VisualMesh *>(vo);
+        data_ = set(data_, int(vm->isUpdated()));
+        if (vm->isUpdated())
+          data_ = set(data_, vm->vertexArray_, vm->colorArray_);
+      }
+
       data_ = set(data_, colorToString(vo->color));
       data_ = setInFloat(data_, vo->size, pos, quat);
       data_ = set(data_, (int32_t) 0);
@@ -1444,6 +1515,9 @@ class RaisimServer final {
     for (auto *obj: world_->getObjList()) {
       for (auto &contact: obj->getContacts()) {
         if (!contact.isObjectA() && contact.getPairObjectBodyType()==BodyType::DYNAMIC)
+          continue;
+
+        if (!contact.getImpulsePtr())
           continue;
 
         contactIncrement++;
@@ -1617,14 +1691,15 @@ class RaisimServer final {
         auto &img = std::static_pointer_cast<RGBCamera>(sensor)->getImageBuffer();
         RSFATAL_IF(width * height * 4 != img.size(), "Image size mismatch. Sensor module not working properly")
         rData_ = getN(rData_, img.data(), width * height * 4);
+        sensor->setUpdateTimeStamp(world_->getWorldTime());
       } else if (type == Sensor::Type::DEPTH) {
         int width, height;
         rData_ = get(rData_, &width, &height);
         auto &depthArray = std::static_pointer_cast<DepthCamera>(sensor)->getDepthArray();
         RSFATAL_IF(width * height != depthArray.size(), "Image size mismatch. Sensor module not working properly")
         rData_ = getN(rData_, depthArray.data(), width * height);
+        sensor->setUpdateTimeStamp(world_->getWorldTime());
       }
-
     }
 
     return true;
@@ -1661,7 +1736,7 @@ class RaisimServer final {
   int screenShotWidth_, screenShotHeight_;
 
   // version
-  constexpr static int version_ = 10014;
+  constexpr static int version_ = 10016;
 
   // visual tag counter
   uint32_t visTagCounter = 30;
@@ -1669,7 +1744,7 @@ class RaisimServer final {
   // hanging object
   uint32_t hangingObjVisTag_ = 0;
   Object* interactingOb_;
-  double wireStiffness_;
+  double wireStiffness_ = 0.;
   int hangingObjLocalId_ = -1;
   Vec<3> hangingObjPos_, hangingObjLocalPos_, hangingObjTargetPos_;
 
